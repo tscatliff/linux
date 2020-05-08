@@ -4,6 +4,12 @@
 
 comment "MMC/SD/SDIO Host Controller Drivers"
 
+config SYSFS_SD_CARD
+  tristate "SysFS SD Card Interface"
+#  depends on ARM
+  help
+    This manages SD cards, including password for unlocking.
+
 config MMC_BCM2835_MMC
 	tristate "MMC support on BCM2835"
 	depends on MACH_BCM2708 || MACH_BCM2709 || ARCH_BCM2835

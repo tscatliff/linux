@@ -21,6 +21,12 @@
 #include <linux/mmc/mmc.h>
 #include <linux/mmc/sd.h>
 
+#ifdef SYSFS_SD_SUPPORT
+#include <linux/scatterlist.h>
+#include <linux/syscalls.h>
+#include <linux/string.h>
+#endif
+
 #include "core.h"
 #include "card.h"
 #include "host.h"
@@ -28,6 +34,30 @@
 #include "mmc_ops.h"
 #include "sd.h"
 #include "sd_ops.h"
+
+// referred to by sysfs_sd_card module
+#ifdef SYSFS_SD_SUPPORT
+#define PASSWORD_LENGTH_MAX 16
+int SYSFS_SD_PASSWORD_LENGTH = 0;
+EXPORT_SYMBOL(SYSFS_SD_PASSWORD_LENGTH);
+char SYSFS_SD_PASSWORD[PASSWORD_LENGTH_MAX];
+EXPORT_SYMBOL(SYSFS_SD_PASSWORD);
+char sysfs_sd_password_last[PASSWORD_LENGTH_MAX] = { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u };
+int SYSFS_SD_CARD_LOCKED = 1;
+EXPORT_SYMBOL(SYSFS_SD_CARD_LOCKED);
+int SYSFS_SD_CARD_INDEX = -1;
+EXPORT_SYMBOL(SYSFS_SD_CARD_INDEX);
+u32 SYSFS_SD_CARD_CID[4] = { 0ULL, 0ULL, 0ULL, 0ULL };
+EXPORT_SYMBOL(SYSFS_SD_CARD_CID);
+u32 SYSFS_SD_CARD_CSD[4] = { 0ULL, 0ULL, 0ULL, 0ULL };
+EXPORT_SYMBOL(SYSFS_SD_CARD_CSD);
+u32 SYSFS_SD_CARD_SSR[16] = { 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL };
+EXPORT_SYMBOL(SYSFS_SD_CARD_SSR);
+u32 SYSFS_SD_CARD_SCR[2] = { 0ULL, 0ULL };
+EXPORT_SYMBOL(SYSFS_SD_CARD_SCR);
+u32 SYSFS_SD_CARD_OCR[1] = { 0ULL };
+EXPORT_SYMBOL(SYSFS_SD_CARD_OCR);
+#endif
 
 static const unsigned int tran_exp[] = {
 	10000,		100000,		1000000,	10000000,
@@ -832,29 +862,316 @@ static int mmc_sd_get_ro(struct mmc_host *host)
 	return ro;
 }
 
+#ifdef SYSFS_SD_SUPPORT
+void mmc_sd_reset_sysfs_sd_data(struct mmc_host *host)
+{
+	if (SYSFS_SD_CARD_INDEX > 0)
+	{
+		pr_warn("%s: Removed card, reset sysfs_sd_card params\n", mmc_hostname(host));
+		SYSFS_SD_CARD_INDEX = -1;
+		memset(SYSFS_SD_CARD_CID, 0, sizeof(SYSFS_SD_CARD_CID));
+		memset(SYSFS_SD_CARD_CSD, 0, sizeof(SYSFS_SD_CARD_CSD));
+		memset(SYSFS_SD_CARD_SSR, 0, sizeof(SYSFS_SD_CARD_SSR));
+		memset(SYSFS_SD_CARD_SCR, 0, sizeof(SYSFS_SD_CARD_SCR));
+		SYSFS_SD_CARD_OCR[0] = 0ULL;
+		SYSFS_SD_CARD_LOCKED = 1;
+	}
+}
+
+int mmc_sd_unlock_card(struct mmc_host *host, struct mmc_card *card)
+{
+	struct mmc_request mrq;
+	struct mmc_command cmd;
+	struct mmc_data data;
+	struct scatterlist sg;
+	int err, data_size;
+	u8 *data_buf = NULL;
+	//int password_fd;
+	//u8 password_length;
+	char tmp[128];
+	char tmpchr[8];
+	int tmpout;
+
+	//password_length = strlen(SYSFS_SD_PASSWORD);
+
+  // check to see if we have a user-provided password
+	//if (password_length == 0) {
+	if (SYSFS_SD_PASSWORD_LENGTH == 0) {
+		pr_err("%s: Card is locked, but the provided password length is 0\n", mmc_hostname(host));
+		return -EIO;
+	}
+
+  memset(tmp, 0, 64);
+  strcpy(tmp, mmc_hostname(host));
+	strcat(tmp, ": User-provided password [");
+	for (tmpout = 0; tmpout < SYSFS_SD_PASSWORD_LENGTH; tmpout++) {
+		if (tmpout > 0) strcat(tmp, " ");
+		memset(tmpchr, 0 , 8);
+		sprintf(tmpchr, "0x%02X", SYSFS_SD_PASSWORD[tmpout]);
+		strcat(tmp, tmpchr);
+	}
+	strcat(tmp, "]");
+	pr_warn("%s\n", tmp);
+
+	// Round up the size of the data block to 512 bytes for SD
+	data_size = 512;
+
+	data_buf = kzalloc(data_size, GFP_KERNEL);
+	if (!data_buf)
+		return -ENOMEM;
+
+/*
+	cid = kzalloc(16, GFP_KERNEL);
+	if (!cid)
+		return -ENOMEM;
+
+	memset(cid, 0, 16);
+
+	pr_warn("%s: CID:\n", mmc_hostname(host));
+	for (i = 0; i < 4; i++) {
+		cid[4*i+0] = (card->raw_cid[i] & 0xFF000000) >> 24;
+		cid[4*i+1] = (card->raw_cid[i] & 0x00FF0000) >> 16;
+		cid[4*i+2] = (card->raw_cid[i] & 0x0000FF00) >>  8;
+		cid[4*i+3] = (card->raw_cid[i] & 0x000000FF); // >> 0;
+		pr_warn("  %02X %02X %02X %02X\n", cid[4*i+0], cid[4*i+1], cid[4*i+2], cid[4*i+3]);
+	}
+
+  pr_warn("%s: Opening password key file...\n", mmc_hostname(host));
+
+  // clear password_key
+	memset(password_key, 0, 17);
+
+	password_length = 0;
+
+  // from linuxjournal.com/article/8110
+	stored_fs = get_fs();
+	set_fs(KERNEL_DS);
+	password_fd = sys_open("/etc/sd_password.key", O_RDONLY, 0);
+	if (password_fd == 0) {
+		pr_err("%s: Error opening password key file\n", mmc_hostname(host));
+		return -EIO;
+	} else {
+		pr_warn("%s: Opened password key file\n", mmc_hostname(host));
+		sys_read(password_fd, password_key, 17);
+		password_length = strlen(password_key);
+		pr_warn("%s: Password key [%u]: %s\n", mmc_hostname(host), password_length, password_key);
+		sys_close(password_fd);
+	}
+	set_fs(stored_fs);
+*/
+
+	data_buf[0] = 0; //(0 << 2); //MMC_LOCK_MODE_UNLOCK;
+	data_buf[1] = SYSFS_SD_PASSWORD_LENGTH;
+	memcpy(data_buf + 2, SYSFS_SD_PASSWORD, SYSFS_SD_PASSWORD_LENGTH);
+
+	memset(&cmd, 0, sizeof(struct mmc_command));
+	cmd.opcode = MMC_LOCK_UNLOCK;
+	cmd.arg = 0;
+	cmd.flags = MMC_RSP_R1 | MMC_CMD_ADTC;
+
+	memset(&data, 0, sizeof(struct mmc_data));
+	mmc_set_data_timeout(&data, card);
+	data.blksz = data_size;
+	data.blocks = 1;
+	data.flags = MMC_DATA_WRITE;
+	data.sg = &sg;
+	data.sg_len = 1;
+
+	memset(&mrq, 0, sizeof(struct mmc_request));
+	mrq.cmd = &cmd;
+	mrq.data = &data;
+
+	//pr_warn("%s: Sending unlock request...\n", mmc_hostname(host));
+
+	sg_init_one(&sg, data_buf, data_size);
+	mmc_wait_for_req(card->host, &mrq);
+	if (cmd.error) {
+		pr_err("%s: Command error in unlock request: %d\n", mmc_hostname(host), cmd.error);
+		err = cmd.error;
+		goto out;
+	}
+	if (data.error) {
+		pr_err("%s: Data error in unlock request: %d\n", mmc_hostname(host), data.error);
+		err = data.error;
+		goto out;
+	}
+
+	memset(&cmd, 0, sizeof(struct mmc_command));
+	cmd.opcode = MMC_SEND_STATUS;
+	cmd.arg = card->rca << 16;
+	cmd.flags = MMC_RSP_R1 | MMC_CMD_AC;
+
+	//pr_warn("%s: Checking result of unlock request...\n", mmc_hostname(host));
+
+	err = mmc_wait_for_cmd(card->host, &cmd, 0);
+	if (err) {
+		pr_err("%s: Error %d during LOCK_UNLOCK operation\n", mmc_hostname(host), err);
+		goto out;
+	}
+
+	if (cmd.resp[0] & 0x01000000) {
+		pr_err("%s: LOCK_UNLOCK operation failed\n", mmc_hostname(host));
+		err = -EIO;
+		goto out;
+	} else if (cmd.resp[0] & 0x02000000) {
+		pr_err("%s: Card still locked after LOCK_UNLOCK\n", mmc_hostname(host));
+		err = -EIO;
+		goto out;
+	}
+
+	//pr_warn("%s: Unlock request successful\n", mmc_hostname(host));
+
+	return 0;
+
+out:
+
+	kfree(data_buf);
+
+	return err;
+}
+
+int mmc_sd_check_card_locked(struct mmc_host *host, struct mmc_card *card)
+{
+
+	struct mmc_command cmd = {};
+  int err;
+	int retry;
+
+	pr_warn("%s: Check card lock status.\n", mmc_hostname(host));
+
+	memset(&cmd, 0, sizeof(struct mmc_command));
+	cmd.opcode = MMC_SEND_STATUS;
+	cmd.arg = card->rca << 16;
+	cmd.flags = MMC_RSP_R1 | MMC_CMD_AC;
+
+	err = mmc_wait_for_cmd(card->host, &cmd, 0);
+	//pr_warn("%s: Status Result:\n  Rsp0: %08X\n  Rsp1: %08X\n  Rsp2: %08X\n  Rsp3: %08X\n  Flag: %04X\n  Errr: %04X\n", mmc_hostname(host), cmd.resp[0],  cmd.resp[1], cmd.resp[2], cmd.resp[3], cmd.flags, -cmd.error);
+
+	if ((cmd.resp[0] & 0x02000000) == 0) {
+		//pr_warn("%s: Card is not locked.\n", mmc_hostname(host));
+		return 0;
+	}
+
+	pr_warn("%s: Attempting card unlock routine\n", mmc_hostname(host));
+
+	for (retry = 0; retry < 3; retry++)
+	{
+		err = mmc_sd_unlock_card(host, card);
+		if (err == 0) break;
+		pr_warn("%s: Retry #%d of card unlock routine\n", mmc_hostname(host), retry+1);
+  }
+
+	return err;
+}
+#endif
+
 int mmc_sd_setup_card(struct mmc_host *host, struct mmc_card *card,
 	bool reinit)
 {
 	int err;
+
+#ifdef SYSFS_SD_SUPPORT
+	int check_lock = 0;
+	//int i;
+
+	if (host->index != 0)
+	{
+		//pr_warn("%s: Checking lock status on index? %d\n", mmc_hostname(host), host->index);
+
+		if (host->index != SYSFS_SD_CARD_INDEX)
+		{
+			SYSFS_SD_CARD_LOCKED = 1;
+			// store the index and CID for display
+			SYSFS_SD_CARD_INDEX = host->index;
+			memcpy(SYSFS_SD_CARD_CID, card->raw_cid, sizeof(SYSFS_SD_CARD_CID));
+			memcpy(SYSFS_SD_CARD_CSD, card->raw_csd, sizeof(SYSFS_SD_CARD_CSD));
+			SYSFS_SD_CARD_OCR[0] = card->ocr;
+			pr_warn("%s: Inserted, try unlock\n", mmc_hostname(host));
+			check_lock = 1;
+		}
+
+		//pr_warn("%s: Locked? [%d], Password? [%s] [%s] [%d]\n", mmc_hostname(host), SYSFS_SD_CARD_LOCKED, sysfs_sd_password_last, SYSFS_SD_PASSWORD, SYSFS_SD_PASSWORD_LENGTH);
+
+		if ((check_lock == 0) && (SYSFS_SD_CARD_LOCKED != 0))
+		{
+			if (strcmp(SYSFS_SD_PASSWORD, sysfs_sd_password_last) != 0)
+			{
+				pr_warn("%s: Password change, try unlocking with new password\n", mmc_hostname(host));
+				check_lock = 1;
+			}
+		}
+
+	  if (check_lock == 1) {
+			SYSFS_SD_CARD_LOCKED = 1;
+			memcpy(sysfs_sd_password_last, SYSFS_SD_PASSWORD, PASSWORD_LENGTH_MAX);
+		  err = mmc_sd_check_card_locked(host, card);
+			if (err) {
+				if (SYSFS_SD_CARD_LOCKED == 1)
+				{
+					pr_err("%s: Card is still locked after unlock attempts\n", mmc_hostname(host));
+					SYSFS_SD_CARD_LOCKED = 2;
+					err = EIO;
+					return err;
+				}
+				else
+				{
+					pr_err("%s: Failure while checking lock status\n", mmc_hostname(host));
+					SYSFS_SD_CARD_LOCKED = 2;
+					err = -EIO;
+					return err;
+				}
+			}
+			else
+			{
+				// password was succcessful
+				SYSFS_SD_CARD_LOCKED = 0;
+			}
+	  }
+		//else
+		//{
+		//	pr_warn("%s: Nothing changed, skipping lock check\n", mmc_hostname(host));
+		//}
+
+		if (SYSFS_SD_CARD_LOCKED != 0)
+		{
+			//pr_err("%s: Card is still locked\n", mmc_hostname(host));
+			err = EIO;
+			return err;
+		}
+	}
+#endif
 
 	if (!reinit) {
 		/*
 		 * Fetch SCR from card.
 		 */
 		err = mmc_app_send_scr(card);
-		if (err)
+		if (err) {
+			//pr_err("%s: error %d in mmc_app_send_scr even after unlock try.\n", mmc_hostname(host), err);
 			return err;
+		}
 
 		err = mmc_decode_scr(card);
 		if (err)
 			return err;
 
+#ifdef SYSFS_SD_SUPPORT
+		memcpy(SYSFS_SD_CARD_SCR, card->raw_scr, sizeof(SYSFS_SD_CARD_SCR));
+#endif
+
 		/*
 		 * Fetch and process SD Status register.
 		 */
 		err = mmc_read_ssr(card);
-		if (err)
+		if (err) {
+			//pr_err("%s: error %d during mmc_read_ssr\n",
+			//	mmc_hostname(host), err);
 			return err;
+		}
+
+#ifdef SYSFS_SD_SUPPORT
+		memcpy(SYSFS_SD_CARD_SSR, card->raw_ssr, sizeof(SYSFS_SD_CARD_SSR));
+#endif
 
 		/* Erase init depends on CSD and SSR */
 		mmc_init_erase(card);
@@ -863,8 +1180,11 @@ int mmc_sd_setup_card(struct mmc_host *host, struct mmc_card *card,
 		 * Fetch switch information from card.
 		 */
 		err = mmc_read_switch(card);
-		if (err)
+		if (err) {
+			pr_err("%s: error %d during mmc_read_switch\n",
+				mmc_hostname(host), err);
 			return err;
+		}
 	}
 
 	/*
@@ -940,8 +1260,10 @@ static int mmc_sd_init_card(struct mmc_host *host, u32 ocr,
 	WARN_ON(!host->claimed);
 retry:
 	err = mmc_sd_get_cid(host, ocr, cid, &rocr);
-	if (err)
+	if (err) {
+		pr_err("%s: error %d during mmc_sd_get_cid\n", mmc_hostname(host), err);
 		return err;
+	}
 
 	if (oldcard) {
 		if (memcmp(cid, oldcard->raw_cid, sizeof(cid)) != 0)
@@ -964,22 +1286,28 @@ retry:
 	/*
 	 * Call the optional HC's init_card function to handle quirks.
 	 */
-	if (host->ops->init_card)
+	if (host->ops->init_card) {
+		pr_warn("%s: calling host driver init_card\n", mmc_hostname(host));
 		host->ops->init_card(host, card);
+  }
 
 	/*
 	 * For native busses:  get card RCA and quit open drain mode.
 	 */
 	if (!mmc_host_is_spi(host)) {
 		err = mmc_send_relative_addr(host, &card->rca);
-		if (err)
+		if (err) {
+			pr_err("%s: error %d during mmc_send_relative_addr\n", mmc_hostname(host), err);
 			goto free_card;
+		}
 	}
 
 	if (!oldcard) {
 		err = mmc_sd_get_csd(host, card);
-		if (err)
+		if (err) {
+			pr_err("%s: error %d during mmc_sd_get_csd\n", mmc_hostname(host), err);
 			goto free_card;
+		}
 
 		mmc_decode_cid(card);
 	}
@@ -996,13 +1324,20 @@ retry:
 	 */
 	if (!mmc_host_is_spi(host)) {
 		err = mmc_select_card(card);
-		if (err)
+		if (err) {
+			pr_err("%s: error %d during mmc_select_card\n", mmc_hostname(host), err);
 			goto free_card;
+		}
 	}
 
 	err = mmc_sd_setup_card(host, card, oldcard != NULL);
-	if (err)
+	if (err) {
+		if (err < 0)
+		{
+			pr_err("%s: error %d during mmc_sd_setup_card\n", mmc_hostname(host), err);
+	 	}
 		goto free_card;
+	}
 
 	/*
 	 * If the card has not been power cycled, it may still be using 1.8V
@@ -1259,8 +1594,13 @@ int mmc_attach_sd(struct mmc_host *host)
 	WARN_ON(!host->claimed);
 
 	err = mmc_send_app_op_cond(host, 0, &ocr);
-	if (err)
+	if (err) {
+		// this fails if no card is in the slot
+#ifdef SYSFS_SD_SUPPORT
+		mmc_sd_reset_sysfs_sd_data(host);
+#endif
 		return err;
+  }
 
 	mmc_attach_bus(host, &mmc_sd_ops);
 	if (host->ocr_avail_sd)
@@ -1297,13 +1637,22 @@ int mmc_attach_sd(struct mmc_host *host)
 	 * Detect and init the card.
 	 */
 	err = mmc_sd_init_card(host, rocr, NULL);
-	if (err)
+	if (err) {
+		// this fails if the card is unreadable
+		// OR THE CARD IS PASSWORD PROTECTED
+		if (err < 0)
+		{
+			pr_err("%s: error %d during mmc_sd_init_card\n", mmc_hostname(host), err);
+		}
 		goto err;
+	}
 
 	mmc_release_host(host);
 	err = mmc_add_card(host->card);
-	if (err)
+	if (err) {
+		pr_err("%s: error %d during mmc_add_card\n", mmc_hostname(host), err);
 		goto remove_card;
+	}
 
 	mmc_claim_host(host);
 	return 0;
@@ -1315,8 +1664,9 @@ remove_card:
 err:
 	mmc_detach_bus(host);
 
-	pr_err("%s: error %d whilst initialising SD card\n",
-		mmc_hostname(host), err);
+  if (err < 0) {
+		pr_err("%s: error %d whilst initialising SD card\n", mmc_hostname(host), err);
+	}
 
 	return err;
 }

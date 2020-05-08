@@ -27,6 +27,13 @@
 #include "host.h"
 #include "sdio_cis.h"
 #include "bus.h"
+#ifdef SYSFS_SD_SUPPORT
+#include "sd.h"
+#endif
+
+extern int SYSFS_SD_CARD_INDEX;
+extern int SYSFS_SD_CARD_LOCKED;
+extern u32 SYSFS_SD_CARD_CID[4];
 
 #define to_mmc_driver(d)	container_of(d, struct mmc_driver, drv)
 
@@ -382,10 +389,16 @@ void mmc_remove_card(struct mmc_card *card)
 	}
 
 	if (mmc_card_present(card)) {
+
+#ifdef SYSFS_SD_SUPPORT
+		mmc_sd_reset_sysfs_sd_data(host);
+#endif
+
 		if (mmc_host_is_spi(card->host)) {
 			pr_info("%s: SPI card removed\n",
 				mmc_hostname(card->host));
 		} else {
+			pr_warn("%s: reset sysfs_sd_card stuff\n", mmc_hostname(card->host));
 			pr_info("%s: card %04x removed\n",
 				mmc_hostname(card->host), card->rca);
 		}
@@ -395,4 +408,3 @@ void mmc_remove_card(struct mmc_card *card)
 
 	put_device(&card->dev);
 }
-

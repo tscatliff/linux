@@ -12,6 +12,8 @@
 #ifndef LINUX_MMC_SD_H
 #define LINUX_MMC_SD_H
 
+#define SYSFS_SD_SUPPORT 1
+
 /* SD commands                           type  argument     response */
   /* class 0 */
 /* This is basically the same command as for MMC with some quirks. */
